@@ -128,7 +128,7 @@ El historial de Git conserva dos estados anteriores:
 
 ```
 .
-├── README.md, instrucciones.md, despliegue.md
+├── readme.md, instrucciones.md, despliegue.md
 ├── pom.xml                      # POM agregador (11 módulos)
 ├── docker-compose.yaml          # despliegue normal (1 réplica)
 ├── docker-compose.escalado.yaml # ejemplo con 2 réplicas de cuentas, pagos y bff-cajero

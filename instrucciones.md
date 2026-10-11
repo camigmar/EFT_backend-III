@@ -1,6 +1,6 @@
 # Instrucciones de compilación, ejecución y pruebas
 
-Guía para compilar, levantar y probar el sistema Banco XYZ en una máquina local con Docker Compose. La descripción de la arquitectura está en el [README](README.md) y la guía de AWS en [despliegue.md](despliegue.md).
+Guía para compilar, levantar y probar el sistema Banco XYZ en una máquina local con Docker Compose. La descripción de la arquitectura está en el [readme](readme.md) y la guía de AWS en [despliegue.md](despliegue.md).
 
 Los ejemplos están pensados para **Windows PowerShell 5.1**. Donde corresponde se incluye la variante para bash (Git Bash, Linux o macOS).
 
