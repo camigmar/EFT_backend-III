@@ -1,218 +1,144 @@
-# Banco XYZ – Microservicios con Spring Cloud
+# Banco XYZ – Arquitectura de microservicios con Spring Cloud
 
-## 1. Objetivo
+Sistema bancario del Banco XYZ construido como microservicios con Spring Boot 4 y Spring Cloud. Cubre la gestión de clientes y cuentas, los pagos (retiros, depósitos y transferencias), la auditoría de eventos y los procesos batch heredados, y atiende a tres canales (web, móvil y cajero automático) a través de un Backend for Frontend (BFF) por canal.
 
-Sistema bancario de microservicios para el Banco XYZ: un **core bancario** que concentra los datos y las operaciones de las cuentas, y **tres BFF (Backend for Frontend)**, uno por canal (web, móvil y cajero automático), que adaptan esas operaciones a lo que necesita cada canal. La plataforma usa Spring Cloud para la configuración centralizada (Config Server), el descubrimiento de servicios (Eureka) y la resiliencia (Resilience4j), OAuth2 para la seguridad, Kafka para la mensajería asíncrona y Docker Compose para levantar todo el sistema.
+El sistema completo se levanta con Docker Compose y admite varias réplicas de los servicios de negocio y de los BFF.
 
-Tecnologías: Java 17, Spring Boot 4.1.0, Spring Cloud 2025.1.2, Spring Security 7 (Authorization Server y Resource Server), Spring Batch, Spring Kafka, MySQL 8, Apache Kafka (KRaft), Maven multi-módulo y Docker.
+- **Cómo compilar, ejecutar y probar:** [instrucciones.md](instrucciones.md)
+- **Guía de despliegue en AWS:** [despliegue.md](despliegue.md)
 
-## 2. Arquitectura y estructura del código
-
-El `pom.xml` de la raíz es el POM padre/agregador: centraliza las versiones (Spring Boot, Spring Cloud, Java 17) y declara los 8 módulos, cada uno con su propio `pom.xml`:
-
-| Módulo | Puerto | Rol |
-|---|---|---|
-| `config-server` | 8888 | Configuración centralizada; sirve los secretos cifrados (`{cipher}`) de `config-repo/` ya descifrados. |
-| `eureka-server` | 8761 | Service Discovery: core y BFF se registran y se encuentran por nombre lógico. |
-| `auth-server` | 9000 | Authorization Server OAuth2: emite tokens JWT con el flujo `client_credentials`. |
-| `core-bancario` | 8080 | API interna de cuentas, transacciones y retiros (MySQL); publica eventos en Kafka. Contiene también los jobs batch. |
-| `bff-web` | 8081 | BFF del canal web (HTTPS): cuenta con estado anual, movimientos y transacciones. |
-| `bff-movil` | 8082 | BFF del canal móvil (HTTPS): datos esenciales de la cuenta y últimos 10 movimientos. |
-| `bff-cajero` | 8083 | BFF del cajero (HTTPS): saldo, validación de cuenta y retiro. |
-| `servicio-auditoria` | 8084 | Consume los eventos de retiro desde Kafka y los registra en el log. |
-
-Docker Compose agrega dos servicios de infraestructura: `mysql` y `kafka`.
+## Arquitectura
 
 ```mermaid
 flowchart LR
-    C[Cliente del canal] -- "1. client_credentials" --> AS[auth-server :9000]
-    AS -- "2. access token JWT" --> C
-    C -- "3. HTTPS + Bearer token" --> BFF["bff-web / bff-movil / bff-cajero"]
-    BFF -. "valida firma via JWKS" .-> AS
-    BFF -- "4. http://core-bancario (Eureka + LoadBalancer, Circuit Breaker)" --> CORE[core-bancario :8080]
-    CORE --> DB[(MySQL)]
-    CORE -- "RetiroRealizado" --> K[[Kafka: retiros-realizados]]
-    K --> AUD[servicio-auditoria]
-    CS[config-server :8888] -. configuracion .-> AS & BFF & CORE
-    EU[eureka-server :8761] -. registro .-> BFF & CORE
+    subgraph Canales
+        CW[App web]
+        CM[App móvil]
+        CC[Cajero automático]
+    end
+
+    AS[auth-server :9000<br/>OAuth2 client_credentials]
+    NG[reverse-proxy nginx<br/>:8081 :8082 :8083<br/>TLS passthrough]
+
+    subgraph BFF [BFF por canal, HTTPS, escalables]
+        BW[bff-web]
+        BM[bff-movil]
+        BC[bff-cajero]
+    end
+
+    subgraph Servicios [Servicios de negocio, red interna, escalables]
+        SCU[servicio-cuentas :8080<br/>cuentas + batch]
+        SCL[servicio-clientes :8085]
+        SPA[servicio-pagos :8086<br/>saga + reconciliador]
+        SAU[servicio-auditoria :8084]
+    end
+
+    subgraph Plataforma
+        CS[config-server :8888]
+        EU[eureka-server :8761]
+    end
+
+    K[[Kafka<br/>retiros-realizados<br/>transacciones-completadas<br/>alertas-seguridad<br/>+ topicos .DLT]]
+    DB[(MySQL 8<br/>banco_xyz · banco_clientes<br/>banco_pagos · banco_auditoria)]
+
+    CW & CM & CC -- "1. token (client_credentials)" --> AS
+    CW & CM & CC -- "2. HTTPS + Bearer" --> NG
+    NG --> BW & BM & BC
+    BW & BM & BC -- "token servicios-internos<br/>Eureka + LoadBalancer + Circuit Breaker" --> SCU
+    SPA -- "débito / crédito idempotentes<br/>Retry + Circuit Breaker" --> SCU
+    SCU -- "valida cliente al abrir cuenta" --> SCL
+    SCU & SCL & SPA & SAU --> DB
+    SCU -- RetiroRealizado --> K
+    SPA -- "TransaccionCompletada<br/>AlertaSeguridad" --> K
+    K --> SAU
+    CS -. configuración y secretos .-> BFF & Servicios & AS
+    EU -. registro y descubrimiento .-> BFF & Servicios
 ```
 
-Cada BFF sigue la estructura `controller → service → client`: el `CoreClient` llama a la API interna de Core (`/api/core/**`) usando el nombre lógico `core-bancario`, que Eureka y Spring Cloud LoadBalancer resuelven a una instancia real.
+**Flujo de una petición:**
+1. El cliente del canal pide un token a `auth-server`, con el flujo `client_credentials` y el scope de su canal.
+2. Llama por HTTPS al puerto de su canal en nginx (`reverse-proxy`), que reparte la conexión entre las réplicas del BFF.
+3. El BFF valida el token y llama a los servicios internos con su propio token `servicios-internos`, que tiene el scope `interno`. Encuentra las instancias por su nombre lógico en Eureka y Spring Cloud LoadBalancer reparte las llamadas entre ellas.
+4. Los servicios publican eventos en Kafka, y `servicio-auditoria` los guarda.
 
-### Endpoints de los BFF
+## Módulos
 
-| BFF | Método | Endpoint |
-|---|---|---|
-| web | GET | `/api/web/cuentas/{cuentaId}`, `/api/web/cuentas/{cuentaId}/movimientos` |
-| web | GET | `/api/web/transacciones`, `/api/web/transacciones/{id}` |
-| móvil | GET | `/api/movil/cuentas/{cuentaId}`, `/api/movil/cuentas/{cuentaId}/movimientos` |
-| cajero | GET | `/api/cajero/cuentas/{cuentaId}/saldo`, `/api/cajero/cuentas/{cuentaId}/validar` |
-| cajero | POST | `/api/cajero/cuentas/{cuentaId}/retiro` con cuerpo `{ "monto": 500 }` |
+El `pom.xml` de la raíz es el POM agregador (Java 17, Spring Boot 4.1.0, Spring Cloud 2025.1.2) y declara 11 módulos Maven. Docker Compose agrega `mysql`, `kafka` y `reverse-proxy` (nginx), así que suma 13 servicios.
 
-Un retiro con saldo insuficiente responde `409 Conflict` con `{ "mensaje": "Saldo insuficiente para realizar el retiro" }`.
+| Módulo / servicio | Puerto | Expuesto al host | Responsabilidad |
+|---|---|---|---|
+| `config-server` | 8888 | Sí | Configuración centralizada (perfil `native`, `config-repo/`). Entrega los secretos `{cipher}` ya descifrados. |
+| `eureka-server` | 8761 | Sí | Registro y descubrimiento de servicios. |
+| `auth-server` | 9000 | Sí | Authorization Server OAuth2. Emite JWT RS256 con `client_credentials` para los clientes `web-client`, `movil-client`, `cajero-client` y `servicios-internos`. |
+| `reverse-proxy` (nginx) | 8081, 8082, 8083 | Sí | Único punto de entrada de los canales. Proxy TCP con TLS passthrough que reparte entre las réplicas de cada BFF. |
+| `bff-web` | 8081 | No (vía nginx) | BFF del canal web (HTTPS, scope `web`): cuenta con estado anual, movimientos y transacciones. |
+| `bff-movil` | 8082 | No (vía nginx) | BFF del canal móvil (HTTPS, scope `movil`): datos esenciales de la cuenta y últimos 10 movimientos. |
+| `bff-cajero` | 8083 | No (vía nginx) | BFF del cajero (HTTPS, scope `cajero`): saldo, validación de cuenta y retiro. |
+| `servicio-cuentas` | 8080 | No | Cuentas: consulta, apertura, mantenimiento, cierre, débito y crédito idempotentes. Incluye los 3 jobs de Spring Batch, que se disparan por endpoint. Base `banco_xyz`. |
+| `servicio-clientes` | 8085 | No | CRUD de clientes, perfiles (BASICO, PREFERENTE, PREMIUM) y baja lógica. Base `banco_clientes`. |
+| `servicio-pagos` | 8086 | No | Retiros, depósitos y transferencias (saga con compensación), `Idempotency-Key`, eventos Kafka y reconciliador de pagos inciertos. Base `banco_pagos`. |
+| `servicio-auditoria` | 8084 | No | Consume los 3 tópicos de Kafka, guarda los eventos y los expone en una API de consulta. Envía a `<tópico>.DLT` los mensajes que no puede procesar. Base `banco_auditoria`. |
+| `seguridad-interna` | — | — | Librería compartida: token `servicios-internos` con caché y renovación, e interceptor de `RestClient` (Bearer, más un reintento ante 401). |
+| `mysql` | 3306 (host 3307) | Sí | MySQL 8, con una base por servicio. `db/init/` crea las bases, los datos iniciales y las tablas de Spring Batch. |
+| `kafka` | 9092 | No | Apache Kafka en modo KRaft, con un solo nodo. |
 
-### Procesos batch (core-bancario)
+## Stack
 
-`core-bancario` conserva los tres jobs de Spring Batch que migraron los procesos legacy (`transaccionesJob`, `interesesJob` y `cuentasAnualesJob`, con particionamiento, multithreading, SkipPolicy y RetryPolicy). Sus resultados son los datos de `db/init/01-datos.sql`. Con `spring.batch.job.enabled=false` los jobs no se ejecutan al arrancar el servicio.
+- **Lenguaje y build:** Java 17 y Maven multi-módulo con wrapper (`mvnw` / `mvnw.cmd`).
+- **Spring:** Spring Boot 4.1.0, Spring Cloud 2025.1.2 (Config Server, Netflix Eureka, LoadBalancer, Circuit Breaker Resilience4j), Spring Security 7 (Authorization Server y Resource Server), Spring Data JPA (Hibernate), Spring Batch 6 (JobRepository JDBC) y Spring Kafka.
+- **Infraestructura:** MySQL 8, Apache Kafka (KRaft), nginx 1.28, Docker y Docker Compose.
+- **Pruebas:** JUnit 5, Mockito, AssertJ y `MockRestServiceServer`.
 
-## 3. Cómo ejecutar
+## Cómo se resuelve cada requisito de negocio
 
-### Requisitos
+| Requisito | Solución |
+|---|---|
+| Gestión de clientes y perfiles | `servicio-clientes`: alta, consulta (por id y por RUT), actualización, cambio de perfil y baja lógica (estado INACTIVO). Valida los datos con Jakarta Validation; un RUT o email duplicado responde 409. |
+| Apertura, mantenimiento y cierre de cuentas | `servicio-cuentas`: la apertura valida en `servicio-clientes` que el cliente exista y esté ACTIVO. El cierre exige saldo 0. Una cuenta CERRADA rechaza débitos, créditos y retiros con 409. |
+| Retiros, depósitos y transferencias | `servicio-pagos`: saga débito → crédito y, si el crédito falla, compensación (devolución al origen). Estados PENDIENTE, COMPLETADO, FALLIDO, COMPENSADO y REQUIERE_REVISION. |
+| Operaciones sin duplicados | Header `Idempotency-Key` en los POST de pagos: la misma clave devuelve el resultado original y otro cuerpo con la misma clave responde 422. Hacia cuentas, cada movimiento lleva la clave `pago-<id>-<operación>`, guardada en `movimientos_idempotentes`. |
+| Consistencia del dinero ante fallas | `ReconciliadorPagos` (cada 10 s) resuelve los pagos de resultado incierto preguntando a cuentas si el movimiento se aplicó: si no se aplicó, cuentas lo anula para siempre; si se aplicó, se completa o se revierte. |
+| Canales web, móvil y cajero | Un BFF por canal, cada uno con su scope OAuth2 y su respuesta adaptada; nginx expone un puerto por canal. |
+| Seguridad | OAuth2 en el borde (un scope por canal) y entre servicios (scope `interno`), con JWT RS256 validados por JWKS. Secretos cifrados en el Config Server y HTTPS en los BFF. Pagos, clientes, cuentas y auditoría no publican puertos. |
+| Auditoría y alertas | Eventos `RetiroRealizado`, `TransaccionCompletada` y `AlertaSeguridad` (OPERACION_RECHAZADA, COMPENSACION_EJECUTADA, REQUIERE_REVISION, MONTO_ELEVADO). Se persisten en `servicio-auditoria` sin duplicados (restricción única por tópico, partición y offset). |
+| Procesos batch heredados | `transaccionesJob`, `interesesJob` y `cuentasAnualesJob` (particionamiento, multithreading, SkipPolicy, RetryPolicy). Se disparan con `POST /api/core/batch/{job}?fecha=` y se ejecutan una sola vez por job y fecha entre todas las réplicas; no alteran saldos existentes. |
+| Resiliencia | Circuit Breaker en BFF → cuentas. Retry con backoff solo ante "no disponible" y Circuit Breaker en pagos → cuentas y en cuentas → clientes. Timeouts explícitos, DLT en Kafka y reconciliador de pagos. |
+| Escalabilidad | Réplicas de cuentas, clientes, pagos, auditoría y BFF (`--scale` o `docker-compose.escalado.yaml`). Las reparten Eureka + LoadBalancer entre servicios y nginx hacia los BFF. Cada servicio tiene límites de CPU y memoria, y healthcheck `readiness`. |
 
-- Docker Desktop (con Docker Compose v2).
-- Puertos libres en el host: 3307, 8081, 8082, 8083, 8761, 8888 y 9000.
+## Legacy vs nueva arquitectura
 
-### Levantar el sistema
+El historial de Git conserva dos estados anteriores:
+- **Batch inicial** (commit `d665378`, "S1 y S2"): una sola aplicación Spring Batch.
+- **Core monolítico con BFF** (rama `backup-pre-microservicios`, commit `c8a9917`): un `core-bancario` que concentraba todo el negocio, más los BFF y la plataforma Spring Cloud.
 
-Desde la raíz del repositorio:
+| Aspecto | Batch inicial (`d665378`) | Core monolítico (`backup-pre-microservicios`) | Arquitectura actual (`main`) |
+|---|---|---|---|
+| Estructura | Una aplicación Spring Batch con 3 jobs. | Maven multi-módulo: `core-bancario` con todo el negocio y los batch, 3 BFF, config, eureka, auth y auditoría. | El core se dividió en `servicio-cuentas`, `servicio-clientes`, `servicio-pagos` y `servicio-auditoria`, más la librería `seguridad-interna` y nginx. |
+| Clientes | No existían. | No existían. | `servicio-clientes`: CRUD, perfiles y baja lógica. |
+| Cuentas | Tabla cargada por `interesesJob`. | Consulta, movimientos y retiro en `core-bancario`. | Además apertura (con validación del cliente), mantenimiento, cierre con estado ACTIVA/CERRADA, y débito/crédito idempotentes con bloqueo pesimista. |
+| Pagos | — | Solo el retiro directo en core. | `servicio-pagos`: retiro, depósito y transferencia con saga y compensación, `Idempotency-Key` y reconciliador. |
+| Datos | MySQL, base única. | Base única `banco_xyz`. | Una base por servicio: `banco_xyz` (cuentas y batch), `banco_clientes`, `banco_pagos` y `banco_auditoria`. |
+| Mensajería | — | Kafka: tópico `retiros-realizados`; la auditoría solo escribía en el log. | 3 tópicos más sus `.DLT`; auditoría persistente con API, reintentos y DLT. |
+| Seguridad | Sin API; contraseña de MySQL en texto plano en `application.properties`. | OAuth2 en los BFF; secretos cifrados en el Config Server; core sin autenticación (solo red interna). | Además todos los servicios son resource servers con scope `interno`, y los BFF y servicios usan el cliente `servicios-internos`. |
+| Resiliencia | SkipPolicy y RetryPolicy en los jobs. | Circuit Breaker BFF → core. | Además Retry y Circuit Breaker en pagos → cuentas y cuentas → clientes, idempotencia, DLT y reconciliación. |
+| Batch | 3 jobs que se ejecutaban al arrancar la aplicación (`spring.batch.job.enabled=true`). | Los mismos jobs dentro de core, sin forma de dispararlos (solo con un flag de arranque) y con JobRepository en memoria. | Se disparan por endpoint, con JobRepository JDBC compartido (una ejecución por job y fecha entre réplicas). El writer conserva saldo, estado y cliente de las cuentas existentes. |
+| Despliegue | Ejecución local (`java -jar`). | Docker Compose: 10 servicios, una réplica cada uno, BFF con puerto publicado. | 13 servicios; nginx como entrada; réplicas, límites de recursos y healthchecks `readiness`; guía de despliegue en AWS. |
 
-```
-docker compose up -d --build
-```
-
-`--build` construye las 8 imágenes `banco/<modulo>:latest`; si ya están construidas basta con `docker compose up -d`. Los servicios arrancan en orden según sus dependencias (`depends_on` con `healthcheck`): primero `mysql`, `kafka`, `config-server` y `eureka-server`; luego `auth-server`; después `core-bancario`, y al final los tres BFF. Hay que esperar a que todos figuren como `healthy`:
-
-```
-docker compose ps
-```
-
-Luego de que estén `healthy`, conviene esperar unos 30 segundos antes de la primera llamada a un BFF: Eureka tarda en propagar el registro de `core-bancario` y, mientras tanto, el BFF puede responder `503`.
-
-La base de datos se carga automáticamente desde `db/init/01-datos.sql` la primera vez que se crea el volumen de MySQL (cuentas, transacciones, movimientos y estados de cuenta anuales). Los usuarios de la tabla `usuarios` los crea `core-bancario` al arrancar.
-
-### URLs útiles
-
-- Dashboard de Eureka: http://localhost:8761
-- Config Server: http://localhost:8888/{servicio}/default
-- Authorization Server (token): http://localhost:9000/oauth2/token
-- BFF web, móvil y cajero: https://localhost:8081, https://localhost:8082, https://localhost:8083
-- MySQL: `localhost:3307` (usuario `root`, base `banco_xyz`)
-
-`core-bancario` y `servicio-auditoria` no publican puertos: solo son accesibles dentro de la red de Docker Compose. Core no tiene autenticación propia, por eso se expone únicamente a través de los BFF.
-
-### Apagar
-
-```
-docker compose down       # detiene y elimina los contenedores; los datos de MySQL se conservan
-docker compose down -v    # además borra el volumen de MySQL (la próxima vez se recarga desde db/init)
-```
-
-### Escalar el servicio de auditoría
-
-```
-docker compose up -d --scale servicio-auditoria=2
-```
-
-Las dos instancias comparten el grupo de consumidores `auditoria`, así que Kafka reparte entre ellas las 2 particiones del topic.
-
-### Ejecución local sin Docker
-
-Cada servicio lee `CONFIG_SERVER_URL` y `EUREKA_URL` con `localhost` como valor por defecto, así que también se pueden ejecutar los jars directamente. Requiere MySQL en `localhost:3306` y un broker Kafka en `localhost:9092`. Primero se compila con `./mvnw clean install`: el test `BatchApplicationTests` necesita `config-server` corriendo, o bien se usa `-DskipTests`. Después se levanta cada módulo con `java -jar <modulo>/target/<modulo>-0.0.1-SNAPSHOT.jar` en este orden: `config-server`, `eureka-server`, `auth-server`, `core-bancario`, los BFF y `servicio-auditoria`.
-
-## 4. Seguridad OAuth2
-
-- **Authorization Server** (`auth-server`, Spring Security 7): emite access tokens JWT firmados con **RS256** mediante el flujo **client_credentials**.
-- **Un cliente por canal**, autenticado con `client_secret_basic`, con tokens de 1 hora:
-
-| Cliente | Scope | BFF que lo acepta |
-|---|---|---|
-| `web-client` | `web` | bff-web (exige `SCOPE_web`) |
-| `movil-client` | `movil` | bff-movil (exige `SCOPE_movil`) |
-| `cajero-client` | `cajero` | bff-cajero (exige `SCOPE_cajero`) |
-
-- **Los BFF son resource servers**: validan la firma de cada token con las claves públicas que publica `auth-server` en `/oauth2/jwks` y exigen el scope de su canal. Sin token responden `401`, y con el token de otro canal responden `403`. Son stateless y no tienen endpoint de login propio.
-- **Los secretos de los clientes** no están en el código: se guardan cifrados (`{cipher}...`) en `config-server/src/main/resources/config-repo/auth-server.properties`. Con el sistema levantado, el Config Server los entrega descifrados:
+## Estructura del repositorio
 
 ```
-curl http://localhost:8888/auth-server/default
+.
+├── README.md, instrucciones.md, despliegue.md
+├── pom.xml                      # POM agregador (11 módulos)
+├── docker-compose.yaml          # despliegue normal (1 réplica)
+├── docker-compose.escalado.yaml # ejemplo con 2 réplicas de cuentas, pagos y bff-cajero
+├── nginx/nginx.conf             # reverse proxy de los canales
+├── db/init/                     # 00-crear-bases.sql, 01-datos.sql, 02-batch-schema.sql
+├── config-server/src/main/resources/config-repo/   # configuración y secretos {cipher} por servicio
+├── seguridad-interna/           # librería compartida (token entre servicios)
+├── auth-server/ config-server/ eureka-server/
+├── bff-web/ bff-movil/ bff-cajero/
+└── servicio-cuentas/ servicio-clientes/ servicio-pagos/ servicio-auditoria/
 ```
 
-### Ejemplo: token del cajero y consulta de saldo
-
-PowerShell 5.1 (reemplazar `<secreto-cajero>` por el valor obtenido del Config Server; el `\"` del cuerpo JSON es el escape que necesita `curl.exe` en esa versión):
-
-```powershell
-$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("cajero-client:<secreto-cajero>"))
-$token = (Invoke-RestMethod -Method Post -Uri http://localhost:9000/oauth2/token `
-    -Headers @{ Authorization = "Basic $basic" } `
-    -Body @{ grant_type = "client_credentials"; scope = "cajero" }).access_token
-
-curl.exe -k -H "Authorization: Bearer $token" https://localhost:8083/api/cajero/cuentas/108/saldo
-curl.exe -k -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" `
-    -d '{\"monto\": 100}' https://localhost:8083/api/cajero/cuentas/108/retiro
-```
-
-Con curl (bash):
-
-```
-curl -s -u cajero-client:<secreto-cajero> -d grant_type=client_credentials -d scope=cajero http://localhost:9000/oauth2/token
-curl -k -H "Authorization: Bearer <access_token>" https://localhost:8083/api/cajero/cuentas/108/saldo
-```
-
-`-k` es necesario porque los BFF usan HTTPS con un certificado autofirmado (`keystore.p12` en los recursos de cada BFF). La contraseña del keystore también llega cifrada desde el Config Server.
-
-## 5. Mensajería con Kafka
-
-- **Productor**: `core-bancario`. Cuando un retiro se completa con éxito, después de guardar el nuevo saldo, publica el evento `RetiroRealizado` (`cuentaId`, `monto`, `nuevoSaldo`, `fecha`) en formato JSON.
-- **Topic**: `retiros-realizados`, con 2 particiones, y la clave del mensaje es el `cuentaId`, así que los eventos de una misma cuenta quedan siempre en la misma partición y en orden. Si Kafka no está disponible, el retiro se completa igual: la falla al publicar solo se registra en el log de Core.
-- **Consumidor**: `servicio-auditoria`, en el grupo `auditoria`. Registra cada evento con su partición, offset y payload:
-
-```
-docker compose logs servicio-auditoria
-```
-
-```
-[AUDITORIA] instancia=puerto 8084 | particion=1 | offset=0 | payload={"cuentaId":108,"monto":100.0,"nuevoSaldo":...,"fecha":"..."}
-```
-
-Con el servicio escalado, todas las instancias muestran el puerto 8084, que es el interno de cada contenedor. Para distinguirlas hay que mirar el prefijo de cada línea en `docker compose logs`, que trae el nombre del contenedor (`servicio-auditoria-1`, `servicio-auditoria-2`).
-
-## 6. Resiliencia
-
-Cada BFF protege sus llamadas a Core con un **circuit breaker de Resilience4j** llamado `core`:
-
-- Ventana de las últimas 4 llamadas; se abre cuando falla el 50 % o más.
-- Abierto durante 10 s; luego pasa a semiabierto y deja pasar 2 llamadas de prueba.
-- **Fallback**: si Core no responde o el circuito está abierto, el BFF devuelve `503 Service Unavailable` con un mensaje controlado en lugar de un error 500.
-- En `bff-cajero`, los errores de negocio de Core (por ejemplo, el `409` por saldo insuficiente) no cuentan como fallas y se devuelven tal cual.
-
-El estado del circuito se consulta en `/actuator/circuitbreakers` de cada BFF, con un token del canal:
-
-```
-curl.exe -k -H "Authorization: Bearer $token" https://localhost:8083/actuator/circuitbreakers
-```
-
-Para probarlo:
-
-```
-docker compose stop core-bancario
-```
-
-Al repetir varias veces una llamada al BFF, las primeras fallan al intentar conectar, y a partir de ahí el circuito pasa a `OPEN` y el BFF responde `503` de inmediato. Con `docker compose start core-bancario`, y pasados los 10 s, el circuito vuelve a `CLOSED` y las llamadas funcionan otra vez.
-
-## 7. Imágenes Docker
-
-Cada módulo tiene su propio `Dockerfile` multi-stage (por ejemplo, `core-bancario/Dockerfile`), construido con la raíz del repositorio como contexto:
-
-- **Etapa build**: `maven:3.9-eclipse-temurin-17` compila solo el módulo y sus dependencias (`mvn -pl <modulo> -am package -DskipTests`), con caché de dependencias de Maven.
-- **Etapa runtime**: `eclipse-temurin:17-jre` con únicamente el jar, ejecutado con un usuario sin privilegios.
-
-Las imágenes se llaman `banco/<modulo>:latest`. Para construir una sola:
-
-```
-docker build -f <modulo>/Dockerfile -t banco/<modulo>:latest .
-```
-
-El `.dockerignore` excluye, entre otros, `target/`, `.git`, `db/` y `docker-compose.yaml`, para que el contexto sea liviano y los cambios en esos archivos no invaliden la caché de construcción.
-
-## 8. Limitaciones conocidas
-
-- La clave de cifrado del Config Server (`encrypt.key`) y la contraseña de MySQL (en `docker-compose.yaml`) están en texto plano en el repositorio. Es aceptable solo como entorno académico; en un entorno real se inyectarían como secretos, por ejemplo con variables de entorno o un gestor de secretos.
-- La tabla `usuarios` y el endpoint `/api/core/auth/validar` de Core siguen existiendo, pero ya no se usan para autenticar: la autenticación de los canales la resuelve OAuth2.
-- `auth-server` genera su clave RSA en memoria al arrancar: si se reinicia, cambia la clave y los tokens emitidos antes dejan de ser válidos.
-- Los clientes OAuth2 se registran en memoria dentro de `auth-server`; agregar o modificar un cliente requiere cambiar el código y volver a desplegar.
-- Los cambios en `config-repo/` requieren reconstruir la imagen de `config-server`, porque los archivos se sirven desde el classpath.
-
-## 9. Evidencias
-
-Las evidencias de ejecución de esta entrega (despliegue con Docker Compose, registro en Eureka, obtención de tokens OAuth2 y llamadas a los BFF, eventos de Kafka y pruebas del circuit breaker) se encuentran en la carpeta de evidencias incluida en la entrega.
+Cada módulo ejecutable tiene su `Dockerfile` multi-stage, que se construye con la raíz del repositorio como contexto.
