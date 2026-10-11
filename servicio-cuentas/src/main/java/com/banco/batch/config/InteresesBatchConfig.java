@@ -13,6 +13,7 @@ import org.springframework.batch.core.step.Step;
 import org.springframework.batch.core.job.builder.JobBuilder;
 import org.springframework.batch.core.job.parameters.RunIdIncrementer;
 import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.batch.infrastructure.item.database.JpaItemWriter;
 import org.springframework.batch.infrastructure.item.database.builder.JpaItemWriterBuilder;
@@ -56,12 +57,15 @@ public class InteresesBatchConfig {
         return new SynchronizedItemStreamReader<>(interesFileReader());
     }
 
+    // @StepScope: el processor guarda las claves ya vistas para descartar duplicados del CSV; con una
+    // instancia por ejecucion, una segunda ejecucion en la misma JVM no hereda ese estado.
     @Bean
+    @StepScope
     public InteresProcessor interesProcessor() {
         return new InteresProcessor();
     }
 
-    // El merge del JpaItemWriter va envuelto para no pisar estado ni clienteId de cuentas ya existentes.
+    // El merge del JpaItemWriter va envuelto para no pisar saldo, estado ni clienteId de cuentas ya existentes.
     @Bean
     public PreservarDatosCuentaWriter interesWriter(EntityManagerFactory emf) {
         JpaItemWriter<CuentaInteres> jpaWriter = new JpaItemWriterBuilder<CuentaInteres>()

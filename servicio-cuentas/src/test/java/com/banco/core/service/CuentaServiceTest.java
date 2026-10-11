@@ -8,6 +8,7 @@ import com.banco.core.client.ClientesClient;
 import com.banco.core.dto.ActualizarCuentaRequestDTO;
 import com.banco.core.dto.AperturaCuentaRequestDTO;
 import com.banco.core.dto.ClienteDTO;
+import com.banco.core.dto.ResolucionMovimientoDTO;
 import com.banco.core.event.RetiroEventPublisher;
 import com.banco.core.event.RetiroRealizadoEvent;
 import com.banco.core.exception.CierreNoPermitidoException;
@@ -382,6 +383,45 @@ class CuentaServiceTest {
         cuentaService.debitar(101L, 100.0);
 
         verifyNoInteractions(movimientoIdempotenteRepository);
+    }
+
+    @Test
+    void resolverMovimientoAplicado_informaAplicadoSinTocarNada() {
+        when(movimientoIdempotenteRepository.findById("pago-7-debito"))
+                .thenReturn(Optional.of(movimiento("pago-7-debito", 101L, "debito", 200.0, 300.0)));
+
+        ResolucionMovimientoDTO resolucion = cuentaService.resolverMovimiento("pago-7-debito", 101L);
+
+        assertThat(resolucion.aplicado()).isTrue();
+        assertThat(resolucion.nuevoSaldo()).isEqualTo(300.0);
+        verify(cuentaInteresRepository).findByIdForUpdate(101L);
+        verify(movimientoIdempotenteRepository, never()).save(any());
+    }
+
+    @Test
+    void resolverMovimientoNoAplicado_loAnulaParaSiempre() {
+        when(movimientoIdempotenteRepository.findById("pago-7-credito")).thenReturn(Optional.empty());
+
+        ResolucionMovimientoDTO resolucion = cuentaService.resolverMovimiento("pago-7-credito", 102L);
+
+        assertThat(resolucion.aplicado()).isFalse();
+        ArgumentCaptor<MovimientoIdempotente> captor = ArgumentCaptor.forClass(MovimientoIdempotente.class);
+        verify(movimientoIdempotenteRepository).save(captor.capture());
+        assertThat(captor.getValue().getOperacion()).isEqualTo("anulado");
+        assertThat(captor.getValue().getCuentaId()).isEqualTo(102L);
+    }
+
+    @Test
+    void creditoAtrasadoConClaveAnulada_seRechazaSinMoverSaldo() {
+        CuentaInteres cuenta = cuenta(102L, 500.0);
+        when(cuentaInteresRepository.findByIdForUpdate(102L)).thenReturn(Optional.of(cuenta));
+        when(movimientoIdempotenteRepository.findById("pago-7-credito"))
+                .thenReturn(Optional.of(movimiento("pago-7-credito", 102L, "anulado", 0.0, 0.0)));
+
+        assertThrows(ClaveIdempotenciaReutilizadaException.class,
+                () -> cuentaService.acreditar(102L, 50.0, "pago-7-credito"));
+        assertThat(cuenta.getSaldo()).isEqualTo(500.0);
+        verify(cuentaInteresRepository, never()).save(any());
     }
 
     private MovimientoIdempotente movimiento(String clave, Long cuentaId, String operacion, Double monto, Double nuevoSaldo) {

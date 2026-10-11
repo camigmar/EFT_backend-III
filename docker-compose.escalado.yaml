@@ -1,0 +1,22 @@
+# Ejemplo de despliegue escalado: 2 replicas de servicio-cuentas, servicio-pagos y bff-cajero.
+# No se carga solo (no es docker-compose.override.yaml): el arranque normal sigue con 1 replica de cada uno.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.escalado.yaml up -d --build
+#
+# Equivale a: docker compose up -d --scale servicio-cuentas=2 --scale servicio-pagos=2 --scale bff-cajero=2
+# servicio-clientes, servicio-auditoria, bff-web y bff-movil tambien admiten replicas (--scale o deploy.replicas).
+# Memoria: cada replica extra suma su mem_limit (512-640 MB); con 2 replicas de estos tres servicios el
+# conjunto queda cerca de 6 GB de limites, dentro de un Docker Desktop de 8 GB.
+
+services:
+  servicio-cuentas:
+    deploy:
+      replicas: 2
+
+  servicio-pagos:
+    deploy:
+      replicas: 2
+
+  bff-cajero:
+    deploy:
+      replicas: 2

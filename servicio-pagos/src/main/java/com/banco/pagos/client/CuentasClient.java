@@ -3,6 +3,8 @@ package com.banco.pagos.client;
 import com.banco.pagos.dto.ErrorDTO;
 import com.banco.pagos.dto.MovimientoCuentaRequestDTO;
 import com.banco.pagos.dto.MovimientoCuentaResponseDTO;
+import com.banco.pagos.dto.ResolucionMovimientoDTO;
+import com.banco.pagos.dto.ResolucionMovimientoRequestDTO;
 import com.banco.pagos.exception.CuentaNoEncontradaException;
 import com.banco.pagos.exception.CuentasException;
 import com.banco.pagos.exception.CuentasNoDisponibleException;
@@ -46,6 +48,33 @@ public class CuentasClient {
 
     public MovimientoCuentaResponseDTO acreditar(Long cuentaId, Double monto, String claveIdempotencia) {
         return ejecutar(() -> mover("credito", cuentaId, monto, claveIdempotencia));
+    }
+
+    // Para el reconciliador: true si el movimiento con esta clave se aplico; false si no (y desde ahora queda anulado
+    // en cuentas, asi que la respuesta es definitiva). Lanza CuentasNoDisponibleException si cuentas no responde.
+    public boolean movimientoAplicado(String claveIdempotencia, Long cuentaId) {
+        return ejecutar(() -> resolver(claveIdempotencia, cuentaId)).aplicado();
+    }
+
+    private ResolucionMovimientoDTO resolver(String claveIdempotencia, Long cuentaId) {
+        try {
+            ResolucionMovimientoDTO resolucion = restClient.post()
+                    .uri("/api/core/movimientos/{clave}/resolucion", claveIdempotencia)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(new ResolucionMovimientoRequestDTO(cuentaId))
+                    .retrieve()
+                    .body(ResolucionMovimientoDTO.class);
+            if (resolucion == null) {
+                throw new CuentasNoDisponibleException("servicio-cuentas respondio sin resolucion para " + claveIdempotencia, null);
+            }
+            return resolucion;
+        } catch (RestClientResponseException ex) {
+            throw traducir(ex, "resolucion", cuentaId);
+        } catch (CuentasException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            throw new CuentasNoDisponibleException("servicio-cuentas no esta disponible", ex);
+        }
     }
 
     // Retry por fuera del CircuitBreaker: cada intento cuenta para el circuito. Solo se reintenta

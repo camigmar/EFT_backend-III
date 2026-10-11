@@ -46,6 +46,9 @@ public class Pago {
     // Status HTTP con que se respondio (201, 409, 404, 503...), para repetir la misma respuesta.
     private Integer statusRespuesta;
 
+    // true cuando ReconciliadorPagos ya resolvio un pago de resultado incierto (no se vuelve a revisar).
+    private Boolean reconciliado;
+
     public Long getId() {
         return id;
     }
@@ -111,5 +114,11 @@ public class Pago {
     }
     public void setStatusRespuesta(Integer statusRespuesta) {
         this.statusRespuesta = statusRespuesta;
+    }
+    public Boolean getReconciliado() {
+        return reconciliado;
+    }
+    public void setReconciliado(Boolean reconciliado) {
+        this.reconciliado = reconciliado;
     }
 }

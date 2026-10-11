@@ -9,6 +9,7 @@ import com.banco.core.client.ClientesClient;
 import com.banco.core.dto.ActualizarCuentaRequestDTO;
 import com.banco.core.dto.AperturaCuentaRequestDTO;
 import com.banco.core.dto.ClienteDTO;
+import com.banco.core.dto.ResolucionMovimientoDTO;
 import com.banco.core.event.RetiroEventPublisher;
 import com.banco.core.event.RetiroRealizadoEvent;
 import com.banco.core.exception.CierreNoPermitidoException;
@@ -41,6 +42,7 @@ public class CuentaService {
 
     static final String OPERACION_DEBITO = "debito";
     static final String OPERACION_CREDITO = "credito";
+    static final String OPERACION_ANULADO = "anulado";
 
     public CuentaService(CuentaInteresRepository cuentaInteresRepository,
                           EstadoCuentaAnualRepository estadoCuentaAnualRepository,
@@ -200,6 +202,29 @@ public class CuentaService {
         cuentaInteresRepository.save(cuenta);
         registrarMovimiento(claveIdempotencia, cuentaId, OPERACION_CREDITO, monto, nuevoSaldo);
         return nuevoSaldo;
+    }
+
+    // Para el reconciliador de servicio-pagos: dice si el movimiento con esta clave se aplico. Si no, lo anula
+    // (marca "anulado" con la misma clave): un debito/credito atrasado que llegue despues con esa clave recibe 422
+    // y nunca se aplica, asi la respuesta es definitiva. Bloquea la cuenta para serializarse con ese movimiento.
+    @Transactional
+    public ResolucionMovimientoDTO resolverMovimiento(String clave, Long cuentaId) {
+        cuentaInteresRepository.findByIdForUpdate(cuentaId);
+        Optional<MovimientoIdempotente> previo = movimientoIdempotenteRepository.findById(clave);
+        if (previo.isPresent()) {
+            MovimientoIdempotente m = previo.get();
+            boolean aplicado = !OPERACION_ANULADO.equals(m.getOperacion());
+            return new ResolucionMovimientoDTO(clave, aplicado, m.getOperacion(), m.getMonto(), m.getNuevoSaldo());
+        }
+        MovimientoIdempotente anulado = new MovimientoIdempotente();
+        anulado.setClave(clave);
+        anulado.setCuentaId(cuentaId);
+        anulado.setOperacion(OPERACION_ANULADO);
+        anulado.setMonto(0.0);
+        anulado.setNuevoSaldo(0.0);
+        anulado.setFecha(LocalDateTime.now());
+        movimientoIdempotenteRepository.save(anulado);
+        return new ResolucionMovimientoDTO(clave, false, OPERACION_ANULADO, 0.0, null);
     }
 
     // Se consulta despues de bloquear la cuenta: dos peticiones con la misma clave sobre la misma

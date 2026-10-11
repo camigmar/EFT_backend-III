@@ -7,16 +7,47 @@ name: banco-xyz
 #   3. servicio-cuentas (necesita config-server, eureka-server, mysql y kafka sanos)
 #   4. bff-web, bff-movil y bff-cajero (necesitan ademas auth-server y servicio-cuentas sanos)
 #      y servicio-pagos (necesita config-server, eureka-server, mysql, kafka y servicio-cuentas sanos)
+#   5. reverse-proxy (nginx), cuando los tres BFF estan sanos: unico punto de entrada a los canales.
 #
 # Dentro de la red de compose cada servicio se alcanza por su nombre, no por localhost.
 # Los application.properties leen CONFIG_SERVER_URL y EUREKA_URL (con localhost por defecto),
 # asi que aqui se definen con los nombres de los servicios. El resto de variables sobrescribe
 # propiedades directamente por relaxed binding (SPRING_DATASOURCE_URL -> spring.datasource.url).
+#
+# Escalado horizontal: servicio-cuentas, -clientes, -pagos, -auditoria y los tres BFF no tienen
+# container_name ni puertos publicados, asi que admiten varias replicas:
+#   docker compose up -d --scale servicio-cuentas=2 --scale servicio-pagos=2 --scale bff-cajero=2
+# o con el archivo de ejemplo (2 replicas de cuentas, pagos y bff-cajero):
+#   docker compose -f docker-compose.yaml -f docker-compose.escalado.yaml up -d
+# Entre servicios, Eureka + Spring Cloud LoadBalancer reparten las llamadas entre replicas; hacia los BFF
+# reparte nginx (reverse-proxy). Una replica nueva o detenida tarda ~30-60 s en reflejarse en los clientes
+# Eureka (cache del registro + cache del LoadBalancer); nginx la ve en ~5 s (DNS de Docker).
+# auth-server, config-server y eureka-server no se escalan (auth-server genera su clave RSA en memoria).
+
+# Limites de recursos comunes. El heap (-Xmx en JAVA_TOOL_OPTIONS) queda por debajo de mem_limit para
+# dejar espacio al metaspace, los hilos y el resto de la JVM.
+x-recursos-app: &recursos-app
+  mem_limit: 512m
+  cpus: 1.0
+
+x-recursos-infra-java: &recursos-infra-java
+  mem_limit: 448m
+  cpus: 0.75
+
+# Healthcheck HTTP por readiness (/actuator/health/readiness: la app acepta trafico y, en los servicios con base
+# de datos, MySQL responde). No depende de Eureka ni del Config Server. start_period amplio por el limite de CPU.
+x-healthcheck-app: &healthcheck-app
+  interval: 10s
+  timeout: 5s
+  retries: 15
+  start_period: 90s
 
 services:
 
   mysql:
     image: mysql:8
+    mem_limit: 768m
+    cpus: 1.0
     environment:
       # Mismo valor que cifra el Config Server para cuentas, clientes, pagos y auditoria; limitacion conocida, entorno de desarrollo.
       MYSQL_ROOT_PASSWORD: NuevaClave123
@@ -38,6 +69,8 @@ services:
 
   kafka:
     image: apache/kafka:latest
+    mem_limit: 1g
+    cpus: 1.0
     # KRaft de un solo nodo: el mismo proceso es broker y controller. Solo accesible dentro de la red.
     environment:
       KAFKA_NODE_ID: 1
@@ -66,6 +99,7 @@ services:
       context: .
       dockerfile: config-server/Dockerfile
     restart: on-failure
+    <<: *recursos-infra-java
     environment:
       JAVA_TOOL_OPTIONS: -Xmx256m
     ports:
@@ -82,6 +116,7 @@ services:
       context: .
       dockerfile: eureka-server/Dockerfile
     restart: on-failure
+    <<: *recursos-infra-java
     environment:
       JAVA_TOOL_OPTIONS: -Xmx256m
     ports:
@@ -98,6 +133,7 @@ services:
       context: .
       dockerfile: auth-server/Dockerfile
     restart: on-failure
+    <<: *recursos-infra-java
     depends_on:
       config-server:
         condition: service_healthy
@@ -119,8 +155,11 @@ services:
       context: .
       dockerfile: servicio-cuentas/Dockerfile
     restart: on-failure
+    mem_limit: 640m
+    cpus: 1.0
     # Sin puerto publicado: solo se alcanza dentro de la red de compose (los BFF y pagos la encuentran
-    # via Eureka) y exige un token de servicios-internos con scope "interno".
+    # via Eureka) y exige un token de servicios-internos con scope "interno". Escalable: los jobs batch
+    # se disparan por endpoint y el JobRepository JDBC compartido impide ejecutarlos dos veces.
     depends_on:
       config-server:
         condition: service_healthy
@@ -141,10 +180,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/banco_xyz?createDatabaseIfNotExists=true
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8080'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/actuator/health/readiness"]
+      <<: *healthcheck-app
 
   servicio-clientes:
     image: banco/servicio-clientes:latest
@@ -152,6 +189,7 @@ services:
       context: .
       dockerfile: servicio-clientes/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     depends_on:
       config-server:
         condition: service_healthy
@@ -170,10 +208,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/banco_clientes?createDatabaseIfNotExists=true
     # Sin puerto publicado: solo accesible dentro de la red, con token de servicios-internos (scope "interno").
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8085'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8085/actuator/health/readiness"]
+      <<: *healthcheck-app
 
   servicio-pagos:
     image: banco/servicio-pagos:latest
@@ -181,6 +217,7 @@ services:
       context: .
       dockerfile: servicio-pagos/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     depends_on:
       config-server:
         condition: service_healthy
@@ -204,17 +241,17 @@ services:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     # Sin puerto publicado: solo accesible dentro de la red, con token de servicios-internos (scope "interno").
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8086'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8086/actuator/health/readiness"]
+      <<: *healthcheck-app
 
+  # Los BFF no publican puertos: se entra por reverse-proxy (8081, 8082, 8083), que reparte entre sus replicas.
   bff-web:
     image: banco/bff-web:latest
     build:
       context: .
       dockerfile: bff-web/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     depends_on:
       config-server:
         condition: service_healthy
@@ -233,13 +270,9 @@ services:
       AUTH_SERVER_URL: http://auth-server:9000
       # Las claves publicas para validar los tokens se descargan de auth-server dentro de la red.
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI: http://auth-server:9000/oauth2/jwks
-    ports:
-      - "8081:8081"
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8081'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8081/actuator/health/readiness"]
+      <<: *healthcheck-app
 
   bff-movil:
     image: banco/bff-movil:latest
@@ -247,6 +280,7 @@ services:
       context: .
       dockerfile: bff-movil/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     depends_on:
       config-server:
         condition: service_healthy
@@ -264,13 +298,9 @@ services:
       # Base de jwk-set-uri (validar JWT) y token-uri (token de servicios-internos) en config-repo.
       AUTH_SERVER_URL: http://auth-server:9000
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI: http://auth-server:9000/oauth2/jwks
-    ports:
-      - "8082:8082"
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8082'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8082/actuator/health/readiness"]
+      <<: *healthcheck-app
 
   bff-cajero:
     image: banco/bff-cajero:latest
@@ -278,6 +308,7 @@ services:
       context: .
       dockerfile: bff-cajero/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     depends_on:
       config-server:
         condition: service_healthy
@@ -295,13 +326,36 @@ services:
       # Base de jwk-set-uri (validar JWT) y token-uri (token de servicios-internos) en config-repo.
       AUTH_SERVER_URL: http://auth-server:9000
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI: http://auth-server:9000/oauth2/jwks
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8083/actuator/health/readiness"]
+      <<: *healthcheck-app
+
+  # Punto de entrada externo de los canales. Proxy TCP con TLS passthrough (ver nginx/nginx.conf): el HTTPS
+  # lo siguen terminando los BFF; nginx solo reparte las conexiones entre las replicas de cada BFF.
+  reverse-proxy:
+    image: nginx:1.28-alpine
+    restart: on-failure
+    mem_limit: 64m
+    cpus: 0.5
+    depends_on:
+      bff-web:
+        condition: service_healthy
+      bff-movil:
+        condition: service_healthy
+      bff-cajero:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
+      - "8081:8081"
+      - "8082:8082"
       - "8083:8083"
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8083'"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8081 && nc -z 127.0.0.1 8082 && nc -z 127.0.0.1 8083"]
       interval: 10s
-      retries: 10
-      start_period: 40s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   servicio-auditoria:
     image: banco/servicio-auditoria:latest
@@ -309,6 +363,7 @@ services:
       context: .
       dockerfile: servicio-auditoria/Dockerfile
     restart: on-failure
+    <<: *recursos-app
     # Sin puerto publicado ni container_name para poder escalarlo con --scale. La API de consulta
     # (/api/auditoria/**) se usa desde dentro de la red: http://servicio-auditoria:8084.
     depends_on:
@@ -331,10 +386,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/banco_auditoria?createDatabaseIfNotExists=true
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8084'"]
-      interval: 10s
-      retries: 10
-      start_period: 40s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8084/actuator/health/readiness"]
+      <<: *healthcheck-app
 
 volumes:
   mysql-data:
