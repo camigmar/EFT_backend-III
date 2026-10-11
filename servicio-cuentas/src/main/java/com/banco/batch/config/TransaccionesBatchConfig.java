@@ -26,7 +26,7 @@ import org.springframework.batch.infrastructure.item.file.builder.FlatFileItemRe
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.TransientDataAccessException;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -38,10 +38,14 @@ public class TransaccionesBatchConfig{
     @StepScope
     public FlatFileItemReader<Transaccion> transaccionReader(
             @Value("#{stepExecutionContext['start']}") Long start,
-            @Value("#{stepExecutionContext['end']}") Long end) {
+            @Value("#{stepExecutionContext['end']}") Long end,
+            @Value("${batch.transacciones.archivo}") Resource archivo) {
         return new FlatFileItemReaderBuilder<Transaccion>()
                 .name("transaccionFileReader")
-                .resource(new ClassPathResource("data/transacciones.csv"))
+                .resource(archivo)
+                // Sin estado guardado: al reanudar un job FAILED cada particion vuelve a leer su rango completo
+                // (start/end); el writer hace merge por id, asi que releer no duplica transacciones.
+                .saveState(false)
                 .linesToSkip((int) (1 + start)) // salta el encabezado y las filas de particiones previas
                 .maxItemCount((int) (end - start))
                 .delimited()
@@ -108,6 +112,9 @@ public class TransaccionesBatchConfig{
                                 @Value("${batch.transacciones.skip-limite}") int skipLimite,
                                 @Value("${batch.transacciones.retry-limite}") int retryLimite) {
         return new StepBuilder("transaccionStep", jobRepository)
+                // Al reanudar un job que fallo en el decider (CRITICO), las particiones ya estaban COMPLETED:
+                // sin esto no se volverian a ejecutar y el decider no veria el archivo corregido.
+                .allowStartIfComplete(true)
                 .<Transaccion, Transaccion>chunk(5, tx)
                 .reader(reader)
                 .processor(processor)
@@ -122,8 +129,8 @@ public class TransaccionesBatchConfig{
     }
 
     @Bean
-    public TransaccionPartitioner transaccionPartitioner() {
-        return new TransaccionPartitioner();
+    public TransaccionPartitioner transaccionPartitioner(@Value("${batch.transacciones.archivo}") Resource archivo) {
+        return new TransaccionPartitioner(archivo);
     }
 
     @Bean
@@ -141,6 +148,8 @@ public class TransaccionesBatchConfig{
                                          PartitionHandler transaccionPartitionHandler,
                                          TransaccionPartitioner transaccionPartitioner) {
         return new StepBuilder("transaccionPartitionStep", jobRepository)
+                // Se vuelve a ejecutar al reanudar el job (ver transaccionStep).
+                .allowStartIfComplete(true)
                 .partitioner("transaccionStep", transaccionPartitioner)
                 .partitionHandler(transaccionPartitionHandler)
                 .build();

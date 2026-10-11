@@ -48,7 +48,7 @@ Por eso no es un test unitario y solo pasa con esa infraestructura levantada. El
 | Módulo | Tests unitarios |
 |---|---|
 | `seguridad-interna` | 8 |
-| `servicio-cuentas` | 43 |
+| `servicio-cuentas` | 61 |
 | `servicio-auditoria` | 8 |
 | `servicio-clientes` | 5 |
 | `servicio-pagos` | 39 |
@@ -273,6 +273,53 @@ curl -s -w ' %{http_code}\n' -X POST -H "$AUTH" "http://servicio-cuentas:8080/ap
 # Repetir con la misma fecha: 409 "ya se ejecuto" (una sola ejecucion por job y fecha, aun con varias replicas)
 curl -s -w ' %{http_code}\n' -X POST -H "$AUTH" "http://servicio-cuentas:8080/api/core/batch/interesesJob?fecha=2026-10-11"
 ```
+
+El `POST` es síncrono: responde cuando termina la ejecución, con `estado` (`COMPLETED` o `FAILED`), `codigoSalida` y `reintentosAutomaticos`.
+
+#### Reejecución automática ante fallos críticos
+
+Si una ejecución termina `FAILED`, el servicio la reanuda solo: hace un restart de la misma JobInstance, que crea una nueva ejecución y retoma desde la ejecución fallida. Lo lanza con `JobOperator.run` y los mismos parámetros, que en Spring Batch aplica las verificaciones de "ya en ejecución" y "ya completada" del JobRepository; `JobOperator.restart(id)` no las aplica en la versión 6. Causas de `FAILED`:
+- **Fallo crítico:** por ejemplo, `transaccionesJob` con más de 5 filas omitidas, que el decider marca `CRITICO`.
+- **Una excepción** durante la ejecución.
+
+**Cómo se reanuda:**
+- Las reanudaciones corren en segundo plano: la respuesta del `POST` ya informa `reintentosAutomaticos` y no espera entre intentos.
+- Esperan `batch.reejecucion.espera` entre un intento y otro, hasta `batch.reejecucion.max-intentos` reintentos.
+- Se detienen apenas una ejecución termina `COMPLETED`.
+- Si se agotan los intentos, el job queda `FAILED` y `servicio-cuentas` registra un log `ERROR` con "requiere intervencion manual".
+- Un job `COMPLETED` nunca se reejecuta (`409`).
+
+**Con varias réplicas:**
+- Solo reintenta la réplica que ejecutó el job.
+- Antes de cada intento comprueba que la ejecución fallida siga siendo la última, así que si ya la reanudó otra réplica o un `/reanudar` manual, cancela su reintento.
+- Si dos réplicas (o dos `/reanudar`) reanudan a la vez la misma ejecución fallida, solo una gana el reclamo en la tabla `batch_reanudaciones` de `banco_xyz` (clave primaria = id de la ejecución fallida) y la otra responde `409`. Las verificaciones del JobRepository por sí solas no lo impiden: en la prueba con 2 réplicas, ambas reanudaban.
+
+```sh
+# Disparar transaccionesJob: 200 con estado COMPLETED (o FAILED y reintentosAutomaticos > 0 si hubo un fallo critico)
+curl -s -w ' %{http_code}\n' -X POST -H "$AUTH" "http://servicio-cuentas:8080/api/core/batch/transaccionesJob?fecha=2026-10-11"
+
+# Estado de un job para una fecha: estado de la ultima ejecucion, intentos (ejecuciones) y el detalle de cada una
+curl -s -H "$AUTH" "http://servicio-cuentas:8080/api/core/batch/transaccionesJob?fecha=2026-10-11"
+
+# Reanudacion manual de la ultima ejecucion FAILED (por ejemplo tras agotar los reintentos y corregir la causa);
+# si la ejecucion ya esta COMPLETED responde 409
+curl -s -w ' %{http_code}\n' -X POST -H "$AUTH" "http://servicio-cuentas:8080/api/core/batch/transaccionesJob/reanudar?fecha=2026-10-11"
+```
+
+`/reanudar` responde:
+- `200`, con la nueva ejecución;
+- `404`, si el job nunca se ejecutó para esa fecha;
+- `409`, si ya está `COMPLETED` o en ejecución.
+
+El `GET` responde `404` en el mismo caso. Sin `fecha`, los tres endpoints usan la fecha de hoy.
+
+**Propiedades de `servicio-cuentas`:** están en `application.properties`; las de reejecución también en `config-repo/servicio-cuentas.properties`, que tiene prioridad.
+
+| Propiedad | Por defecto | Uso |
+|---|---|---|
+| `batch.reejecucion.max-intentos` | `2` | Reanudaciones automáticas de una ejecución `FAILED` (0 las desactiva). |
+| `batch.reejecucion.espera` | `5s` | Espera antes de cada reanudación automática. |
+| `batch.transacciones.archivo` | `classpath:data/transacciones.csv` | CSV de `transaccionesJob`. Se puede apuntar a otro archivo con la variable `BATCH_TRANSACCIONES_ARCHIVO=file:/ruta.csv`, por ejemplo para reproducir un fallo crítico con un CSV con errores. |
 
 ### Circuit breakers
 

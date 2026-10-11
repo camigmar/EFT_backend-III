@@ -1,14 +1,23 @@
 package com.banco.batch.partition;
 
+import java.io.BufferedReader;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import org.springframework.batch.core.partition.Partitioner;
 import org.springframework.batch.infrastructure.item.ExecutionContext;
-import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
 
 public class TransaccionPartitioner implements Partitioner {
+
+    private final Resource archivo;
+
+    // El archivo viene de la propiedad batch.transacciones.archivo (por defecto el CSV del classpath).
+    public TransaccionPartitioner(Resource archivo) {
+        this.archivo = archivo;
+    }
 
     @Override
     public Map<String, ExecutionContext> partition(int gridSize) {
@@ -34,11 +43,13 @@ public class TransaccionPartitioner implements Partitioner {
         return particiones;
     }
 
+    // Por stream y no con getFile(): dentro del jar el CSV del classpath no es un archivo del sistema.
     private long contarFilasDeDatos() {
-        try (var lines = Files.lines(new ClassPathResource("data/transacciones.csv").getFile().toPath())) {
-            return lines.count() - 1;
+        try (BufferedReader lector = new BufferedReader(
+                new InputStreamReader(archivo.getInputStream(), StandardCharsets.UTF_8))) {
+            return lector.lines().count() - 1;
         } catch (IOException e) {
-            throw new IllegalStateException("No se pudo leer data/transacciones.csv", e);
+            throw new IllegalStateException("No se pudo leer " + archivo.getDescription(), e);
         }
     }
 }
